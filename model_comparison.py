@@ -25,14 +25,13 @@ import numpy as np
 import pandas as pd
 from joblib import dump
 from sklearn.calibration import CalibrationDisplay
-from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (PrecisionRecallDisplay, average_precision_score,
                              make_scorer, precision_score, recall_score,
                              f1_score, accuracy_score)
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
