@@ -1,239 +1,353 @@
-"""Autograder tests for Integration 5B — Model Comparison & Decision Memo."""
+"""Autograder for Integration 5B — Model Comparison & Decision Memo.
 
-import pytest
-import sys
+Validates structural correctness and relative behavior. Assertions are
+tied to ratios, baselines, and structural properties rather than
+hardcoded numeric targets — matching realistic ML behavior and the
+dataset's pedagogical properties.
+"""
+
+import ast
+import inspect
 import os
-import tempfile
-import shutil
+import sys
+from datetime import datetime
+
+import matplotlib
+matplotlib.use("Agg")
 
 import numpy as np
 import pandas as pd
+import pytest
+from joblib import load as joblib_load
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from model_comparison import (load_and_prepare, build_preprocessor,
-                               define_models, evaluate_all,
-                               save_results, log_experiment,
-                               save_best_model,
-                               plot_pr_curves, plot_calibration)
-
-DATA_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data", "telecom_churn.csv"
+from model_comparison import (
+    NUMERIC_FEATURES,
+    define_models,
+    find_tree_vs_linear_disagreement,
+    load_and_preprocess,
+    log_experiment,
+    plot_calibration_top3,
+    plot_pr_curves_top3,
+    run_cv_comparison,
+    save_best_model,
+    save_comparison_table,
 )
 
 
-# ── Data Loading ──────────────────────────────────────────────────────────
+# ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-def test_data_loaded():
-    """load_and_prepare returns (X, y) with correct shape and no target leak."""
-    result = load_and_prepare(DATA_PATH)
-    assert result is not None, "load_and_prepare returned None"
-    X, y = result
-    assert X.shape[0] > 1000, f"Expected >1000 rows, got {X.shape[0]}"
-    assert "churned" not in X.columns, "Target should not be in features"
-    assert len(y) == len(X), "X and y must have same length"
-    assert set(y.unique()).issubset({0, 1}), "Target should be binary (0/1)"
+@pytest.fixture(scope="module")
+def data():
+    """Ensure cwd is repo root so load_and_preprocess finds data/telecom_churn.csv."""
+    os.chdir(os.path.join(os.path.dirname(__file__), ".."))
+    result = load_and_preprocess()
+    assert result is not None, "load_and_preprocess() returned None — implement Task 1"
+    return result
 
 
-def test_features_include_numeric_and_categorical():
-    """Features should include both numeric and categorical columns."""
-    X, _ = load_and_prepare(DATA_PATH)
-    numeric_expected = {"tenure", "monthly_charges", "total_charges"}
-    categorical_expected = {"contract_type", "internet_service"}
-    assert numeric_expected.issubset(set(X.columns)), (
-        f"Missing numeric features: {numeric_expected - set(X.columns)}"
+@pytest.fixture(scope="module")
+def models():
+    """Define model configurations once."""
+    result = define_models()
+    assert result is not None, "define_models() returned None — implement Task 2"
+    return result
+
+
+@pytest.fixture(scope="module")
+def cv_results(models, data):
+    """Run CV once, reuse across tests. Module-scoped for speed."""
+    X_train, X_test, y_train, y_test = data
+    result = run_cv_comparison(models, X_train, y_train)
+    assert result is not None, "run_cv_comparison() returned None — implement Task 3"
+    return result
+
+
+@pytest.fixture(scope="module")
+def fitted_models(models, data):
+    """Fit all models on training data once; reuse across tests."""
+    X_train, X_test, y_train, y_test = data
+    fitted = {}
+    for name, pipeline in models.items():
+        pipeline.fit(X_train, y_train)
+        fitted[name] = pipeline
+    return fitted
+
+
+# ─── Task 1: Data loading + split ────────────────────────────────────────────
+
+def test_load_and_preprocess_shape(data):
+    X_train, X_test, y_train, y_test = data
+    total = len(X_train) + len(X_test)
+    assert total >= 4000, f"Dataset too small: {total} rows"
+    test_ratio = len(X_test) / total
+    assert 0.18 <= test_ratio <= 0.22, f"Test ratio {test_ratio:.3f} not ~0.20"
+
+
+def test_load_and_preprocess_stratification(data):
+    X_train, X_test, y_train, y_test = data
+    train_rate = float(y_train.mean())
+    test_rate = float(y_test.mean())
+    assert abs(train_rate - test_rate) < 0.02, (
+        f"Stratification not preserved: train={train_rate:.3f}, test={test_rate:.3f}. "
+        "Use stratify=y in train_test_split."
     )
-    assert categorical_expected.issubset(set(X.columns)), (
-        f"Missing categorical features: {categorical_expected - set(X.columns)}"
+
+
+def test_load_and_preprocess_features(data):
+    X_train, X_test, y_train, y_test = data
+    assert list(X_train.columns) == NUMERIC_FEATURES, (
+        f"X_train columns should be exactly NUMERIC_FEATURES. Got {list(X_train.columns)}"
     )
 
 
-# ── Preprocessor ──────────────────────────────────────────────────────────
+# ─── Task 2: Model definitions ───────────────────────────────────────────────
 
-def test_preprocessor():
-    """build_preprocessor returns a working ColumnTransformer."""
-    prep = build_preprocessor()
-    assert prep is not None, "build_preprocessor returned None"
-    assert hasattr(prep, "fit_transform"), "Preprocessor must have fit_transform"
-
-
-def test_preprocessor_transforms_data():
-    """Preprocessor transforms data without error and expands columns."""
-    X, _ = load_and_prepare(DATA_PATH)
-    prep = build_preprocessor()
-    transformed = prep.fit_transform(X)
-    assert transformed is not None
-    assert transformed.shape[0] == X.shape[0], "Row count must be preserved"
-    assert transformed.shape[1] > X.shape[1], (
-        "Transformed data should have more columns (OneHotEncoder expansion)"
+def test_define_models_has_6_configurations(models):
+    assert len(models) == 6, (
+        f"Expected exactly 6 model configurations, got {len(models)}"
     )
 
 
-# ── Model Definitions ────────────────────────────────────────────────────
-
-def test_models_defined():
-    """define_models returns at least 6 named Pipelines."""
-    models = define_models()
-    assert models is not None, "define_models returned None"
-    assert len(models) >= 6, f"Expected >= 6 models, got {len(models)}"
-    for name, pipe in models.items():
-        assert hasattr(pipe, "fit"), f"'{name}' must have fit method"
-        assert hasattr(pipe, "predict"), f"'{name}' must have predict method"
-
-
-def test_models_are_pipelines():
-    """Each model should be a Pipeline (preprocessor + estimator)."""
-    from sklearn.pipeline import Pipeline
-    models = define_models()
-    assert models is not None
+def test_define_models_are_pipelines(models):
     for name, pipe in models.items():
         assert isinstance(pipe, Pipeline), (
-            f"'{name}' should be a Pipeline, got {type(pipe).__name__}"
+            f"'{name}' should be a sklearn Pipeline, got {type(pipe).__name__}"
         )
 
 
-def test_models_include_both_families():
-    """Models must include both linear and tree-based model families."""
-    models = define_models()
-    assert models is not None
+def test_define_models_includes_dummy(models):
     names_lower = [n.lower() for n in models.keys()]
-    has_linear = any("log" in n or "ridge" in n for n in names_lower)
-    has_tree = any("tree" in n or "forest" in n or "rf" in n for n in names_lower)
-    assert has_linear, "Models must include at least one linear model (LogReg or Ridge)"
-    assert has_tree, "Models must include at least one tree-based model (DecisionTree or RandomForest)"
-
-
-def test_models_include_dummy_baseline():
-    """A DummyClassifier baseline must be among the defined models."""
-    models = define_models()
-    assert models is not None
-    names_lower = [n.lower() for n in models.keys()]
-    assert any("dummy" in n or "baseline" in n for n in names_lower), (
+    assert any("dummy" in n for n in names_lower), (
         "Models must include a DummyClassifier baseline"
     )
 
 
-# ── Evaluation ────────────────────────────────────────────────────────────
-
-def test_evaluation_runs():
-    """evaluate_all returns a DataFrame with expected shape and columns."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    assert models is not None
-
-    results = evaluate_all(models, X, y)
-    assert results is not None, "evaluate_all returned None"
-    assert isinstance(results, pd.DataFrame), "Results must be a DataFrame"
-    assert len(results) >= 6, f"Expected >= 6 rows, got {len(results)}"
+def test_define_models_includes_both_families(models):
+    names_lower = [n.lower() for n in models.keys()]
+    has_lr = any("lr" in n or "log" in n for n in names_lower)
+    has_tree = any("rf" in n or "forest" in n or "tree" in n or "dt" in n
+                   for n in names_lower)
+    assert has_lr, "Models must include LogisticRegression variants"
+    assert has_tree, "Models must include tree-based model variants"
 
 
-def test_evaluation_has_required_columns():
-    """Results DataFrame must contain mean columns for all required metrics."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    results = evaluate_all(models, X, y)
-    assert results is not None
-
-    required_cols = [
-        "accuracy_mean", "precision_mean", "recall_mean",
-        "f1_mean", "pr_auc_mean",
-    ]
-    for col in required_cols:
-        assert col in results.columns, f"Missing column: {col}"
+def test_define_models_has_balanced_variants(models):
+    """The 2x2 default-vs-balanced pattern must be present."""
+    names_lower = [n.lower() for n in models.keys()]
+    has_balanced = sum("balanced" in n for n in names_lower)
+    assert has_balanced >= 2, (
+        f"Expected at least 2 'balanced' model variants (LR + RF), found {has_balanced}"
+    )
 
 
-def test_evaluation_metrics_are_reasonable():
-    """Metric values should be in [0, 1] and real models should beat baseline."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    results = evaluate_all(models, X, y)
-    assert results is not None
+# ─── Task 3: Cross-validation comparison ─────────────────────────────────────
 
-    for col in ["accuracy_mean", "precision_mean", "recall_mean", "f1_mean"]:
-        if col in results.columns:
-            values = results[col].values
-            assert all(0 <= v <= 1 for v in values), (
-                f"All {col} values should be in [0, 1]"
+def test_cv_results_shape(cv_results):
+    assert isinstance(cv_results, pd.DataFrame), "run_cv_comparison must return a DataFrame"
+    assert len(cv_results) == 6, f"Expected 6 rows (one per model), got {len(cv_results)}"
+
+
+def test_cv_results_has_required_columns(cv_results):
+    required = ["model", "accuracy_mean", "accuracy_std", "precision_mean",
+                "precision_std", "recall_mean", "recall_std", "f1_mean",
+                "f1_std", "pr_auc_mean", "pr_auc_std"]
+    missing = [c for c in required if c not in cv_results.columns]
+    assert not missing, f"Missing columns in CV results: {missing}"
+
+
+def test_cv_results_metrics_in_valid_range(cv_results):
+    metric_cols = [c for c in cv_results.columns if c.endswith("_mean")]
+    for col in metric_cols:
+        values = cv_results[col].astype(float)
+        assert all(0.0 <= v <= 1.0 for v in values), (
+            f"All {col} values must be in [0, 1]. Got: {values.tolist()}"
+        )
+
+
+def test_dummy_pr_auc_below_baseline_gap(cv_results):
+    """Dummy PR-AUC should be clearly separated from real models."""
+    dummy_row = cv_results[cv_results["model"].str.lower().str.contains("dummy")]
+    assert len(dummy_row) == 1, "Expected exactly one Dummy model row"
+    dummy_auc = float(dummy_row["pr_auc_mean"].iloc[0])
+    non_dummy = cv_results[~cv_results["model"].str.lower().str.contains("dummy")]
+    worst_real = float(non_dummy["pr_auc_mean"].min())
+    assert dummy_auc < worst_real, (
+        f"Dummy PR-AUC ({dummy_auc:.3f}) should be strictly below the worst "
+        f"real model ({worst_real:.3f})"
+    )
+
+
+def test_each_model_pr_auc_above_baseline(cv_results):
+    """Every non-Dummy model should beat 1.5x the Dummy PR-AUC (positive rate)."""
+    dummy_row = cv_results[cv_results["model"].str.lower().str.contains("dummy")]
+    dummy_auc = float(dummy_row["pr_auc_mean"].iloc[0])
+    non_dummy = cv_results[~cv_results["model"].str.lower().str.contains("dummy")]
+    for _, row in non_dummy.iterrows():
+        auc = float(row["pr_auc_mean"])
+        assert auc >= 1.5 * dummy_auc, (
+            f"{row['model']} PR-AUC ({auc:.3f}) should be >= 1.5x Dummy "
+            f"({dummy_auc:.3f}). The model isn't learning."
+        )
+
+
+def test_class_weight_recall_shift_lr_level(cv_results):
+    """LR balanced recall@0.5 should be materially higher than LR default.
+
+    class_weight='balanced' shifts the operating point at the default 0.5
+    threshold — this is the correct framing (not "improves recall").
+    """
+    lr_default = cv_results[cv_results["model"].str.lower().str.contains("lr") &
+                            cv_results["model"].str.lower().str.contains("default")]
+    lr_balanced = cv_results[cv_results["model"].str.lower().str.contains("lr") &
+                             cv_results["model"].str.lower().str.contains("balanced")]
+    if len(lr_default) == 1 and len(lr_balanced) == 1:
+        r_def = float(lr_default["recall_mean"].iloc[0])
+        r_bal = float(lr_balanced["recall_mean"].iloc[0])
+        if r_def > 0:
+            ratio = r_bal / r_def
+            assert ratio >= 1.5, (
+                f"LR balanced recall ({r_bal:.3f}) should be >= 1.5x LR default "
+                f"recall ({r_def:.3f}) at the default 0.5 threshold. Got ratio={ratio:.2f}x"
             )
 
 
-# ── Output Files ──────────────────────────────────────────────────────────
-
-def test_save_results_creates_csv():
-    """save_results should create a comparison_table.csv file."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    results = evaluate_all(models, X, y)
-    assert results is not None
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        save_results(results, output_dir=tmpdir)
-        csv_path = os.path.join(tmpdir, "comparison_table.csv")
-        assert os.path.exists(csv_path), "comparison_table.csv not created"
-        saved_df = pd.read_csv(csv_path)
-        assert len(saved_df) >= 6, "CSV should contain all model results"
-
-
-def test_log_experiment_creates_csv():
-    """log_experiment should create an experiment_log.csv with timestamps."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    results = evaluate_all(models, X, y)
-    assert results is not None
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        log_experiment(results, output_dir=tmpdir)
-        log_path = os.path.join(tmpdir, "experiment_log.csv")
-        assert os.path.exists(log_path), "experiment_log.csv not created"
-        log_df = pd.read_csv(log_path)
-        assert len(log_df) >= 6, "Log should contain one row per model"
-        assert "timestamp" in log_df.columns, "Log must include a timestamp column"
+def test_class_weight_recall_shift_rf_level(cv_results):
+    """RF balanced recall should be materially higher than RF default."""
+    rf_default = cv_results[cv_results["model"].str.lower().str.contains("rf") &
+                            cv_results["model"].str.lower().str.contains("default")]
+    rf_balanced = cv_results[cv_results["model"].str.lower().str.contains("rf") &
+                             cv_results["model"].str.lower().str.contains("balanced")]
+    if len(rf_default) == 1 and len(rf_balanced) == 1:
+        r_def = float(rf_default["recall_mean"].iloc[0])
+        r_bal = float(rf_balanced["recall_mean"].iloc[0])
+        if r_def > 0:
+            ratio = r_bal / r_def
+            assert ratio >= 1.5, (
+                f"RF balanced recall ({r_bal:.3f}) should be >= 1.5x RF default "
+                f"recall ({r_def:.3f}) at the default 0.5 threshold. Got ratio={ratio:.2f}x"
+            )
 
 
-def test_save_best_model_creates_joblib():
-    """save_best_model should save a .joblib file."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    results = evaluate_all(models, X, y)
-    assert results is not None
+# ─── Task 4: Comparison table saved ──────────────────────────────────────────
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        save_best_model(models, results, X, y, output_dir=tmpdir)
-        joblib_path = os.path.join(tmpdir, "best_model.joblib")
-        assert os.path.exists(joblib_path), "best_model.joblib not created"
-        # Verify the saved model can be loaded
-        from joblib import load
-        loaded = load(joblib_path)
-        assert hasattr(loaded, "predict"), "Loaded model must have predict method"
+def test_comparison_table_saved_to_csv(tmp_path, cv_results):
+    output = tmp_path / "comparison_table.csv"
+    save_comparison_table(cv_results, str(output))
+    assert output.exists(), "save_comparison_table did not create the file"
+    saved = pd.read_csv(output)
+    assert len(saved) >= 6, f"CSV should have >= 6 rows, got {len(saved)}"
 
 
-# ── Plot Files ───────────────────────────────────────────────────────────
+# ─── Task 5: PR curves ───────────────────────────────────────────────────────
 
-def test_plot_pr_curves_creates_file():
-    """plot_pr_curves should create a pr_curves.png in the output directory."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    assert models is not None
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        plot_pr_curves(models, X, y, output_dir=tmpdir)
-        plot_path = os.path.join(tmpdir, "pr_curves.png")
-        assert os.path.exists(plot_path), (
-            "pr_curves.png not created — plot_pr_curves must honor output_dir "
-            "and save the figure there"
-        )
+def test_pr_curves_plot_created(tmp_path, fitted_models, data):
+    X_train, X_test, y_train, y_test = data
+    output = tmp_path / "pr_curves.png"
+    plot_pr_curves_top3(fitted_models, X_test, y_test, str(output))
+    assert output.exists(), "plot_pr_curves_top3 did not save a file"
+    assert output.stat().st_size > 1000, (
+        "PR curve PNG is suspiciously small — did you call plt.savefig AFTER plotting?"
+    )
 
 
-def test_plot_calibration_creates_file():
-    """plot_calibration should create a calibration.png in the output directory."""
-    X, y = load_and_prepare(DATA_PATH)
-    models = define_models()
-    assert models is not None
+# ─── Task 6: Calibration plot ────────────────────────────────────────────────
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        plot_calibration(models, X, y, output_dir=tmpdir)
-        plot_path = os.path.join(tmpdir, "calibration.png")
-        assert os.path.exists(plot_path), (
-            "calibration.png not created — plot_calibration must honor output_dir "
-            "and save the figure there"
-        )
+def test_calibration_plot_created(tmp_path, fitted_models, data):
+    X_train, X_test, y_train, y_test = data
+    output = tmp_path / "calibration.png"
+    plot_calibration_top3(fitted_models, X_test, y_test, str(output))
+    assert output.exists(), "plot_calibration_top3 did not save a file"
+    assert output.stat().st_size > 1000, (
+        "Calibration PNG is suspiciously small — did you call plt.savefig AFTER plotting?"
+    )
+
+
+# ─── Task 7: Best model saved ────────────────────────────────────────────────
+
+def test_best_model_saved_as_joblib(tmp_path, fitted_models, cv_results):
+    best_name = cv_results.sort_values("pr_auc_mean", ascending=False).iloc[0]["model"]
+    output = tmp_path / "best_model.joblib"
+    save_best_model(fitted_models[best_name], str(output))
+    assert output.exists(), "save_best_model did not create the file"
+    loaded = joblib_load(str(output))
+    assert hasattr(loaded, "predict_proba"), (
+        "Loaded model must have predict_proba (it's a Pipeline with a classifier)"
+    )
+
+
+# ─── Task 8: Experiment log ──────────────────────────────────────────────────
+
+def test_experiment_log_has_all_models(tmp_path, cv_results):
+    output = tmp_path / "experiment_log.csv"
+    log_experiment(cv_results, str(output))
+    assert output.exists(), "log_experiment did not create the file"
+    log_df = pd.read_csv(output)
+    assert len(log_df) >= 6, f"Experiment log should have >= 6 rows, got {len(log_df)}"
+    required_cols = {"model_name", "accuracy", "precision", "recall", "f1",
+                     "pr_auc", "timestamp"}
+    missing = required_cols - set(log_df.columns)
+    assert not missing, f"Experiment log missing columns: {missing}"
+
+
+# ─── Task 9: Tree-vs-linear disagreement ─────────────────────────────────────
+
+def test_tree_vs_linear_disagreement_structure(fitted_models, data):
+    """Disagreement finding must return a valid dict with meaningful diff."""
+    X_train, X_test, y_train, y_test = data
+    # Get RF and LR pipelines
+    rf_key = [k for k in fitted_models if "rf" in k.lower() and "balanced" not in k.lower()]
+    lr_key = [k for k in fitted_models if "lr" in k.lower() and "balanced" not in k.lower()]
+    assert rf_key, "No RF_default model found in fitted_models"
+    assert lr_key, "No LR_default model found in fitted_models"
+
+    d = find_tree_vs_linear_disagreement(
+        fitted_models[rf_key[0]], fitted_models[lr_key[0]],
+        X_test, y_test, NUMERIC_FEATURES
+    )
+    assert d is not None, "find_tree_vs_linear_disagreement() returned None"
+    required = {"sample_idx", "feature_values", "rf_proba", "lr_proba",
+                "prob_diff", "true_label"}
+    assert required.issubset(d.keys()), (
+        f"Missing keys in disagreement dict: {required - set(d.keys())}"
+    )
+    assert isinstance(d["sample_idx"], (int, np.integer))
+    assert isinstance(d["feature_values"], dict)
+    assert len(d["feature_values"]) == len(NUMERIC_FEATURES), (
+        f"feature_values should have {len(NUMERIC_FEATURES)} keys"
+    )
+    assert 0.0 <= float(d["rf_proba"]) <= 1.0
+    assert 0.0 <= float(d["lr_proba"]) <= 1.0
+    assert float(d["prob_diff"]) >= 0.15, (
+        f"prob_diff should be >= 0.15 (meaningful disagreement); got {d['prob_diff']:.3f}"
+    )
+    assert int(d["true_label"]) in (0, 1)
+    # Consistency: diff should equal |rf_proba - lr_proba|
+    computed_diff = abs(float(d["rf_proba"]) - float(d["lr_proba"]))
+    assert abs(computed_diff - float(d["prob_diff"])) < 1e-6
+
+
+def test_tree_vs_linear_disagreement_uses_predict_proba():
+    """find_tree_vs_linear_disagreement must use predict_proba, not predict."""
+    source = inspect.getsource(find_tree_vs_linear_disagreement)
+    assert "predict_proba" in source, (
+        "find_tree_vs_linear_disagreement must call predict_proba to compare "
+        "probability estimates between models."
+    )
+
+
+# ─── CV uses StratifiedKFold (AST check) ─────────────────────────────────────
+
+def test_cv_comparison_uses_stratified_kfold():
+    """run_cv_comparison should use StratifiedKFold for proper evaluation."""
+    source = inspect.getsource(run_cv_comparison)
+    assert "StratifiedKFold" in source, (
+        "run_cv_comparison must use StratifiedKFold for cross-validation "
+        "to maintain class balance across folds."
+    )
